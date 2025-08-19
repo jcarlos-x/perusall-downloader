@@ -1,0 +1,428 @@
+void (async function() {
+    try {
+        // Prevent multiple runs
+        if (window.downloaderRunning) {
+            console.log('Downloader already running...');
+            return;
+        }
+        window.downloaderRunning = true;
+
+        // Load jsPDF if not already loaded
+        if (!window.jspdf) {
+            console.log('Loading jsPDF library...');
+            await new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+                script.onload = () => {
+                    console.log('jsPDF loaded successfully');
+                    resolve();
+                };
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        }
+
+        // Helper function to wait for elements to be present
+        const waitForElement = async (selector, timeout = 10000) => {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                const element = document.querySelector(selector);
+                if (element) return element;
+                await new Promise(r => setTimeout(r, 100));
+            }
+            return null;
+        };
+
+        // Try to detect total pages and collect images from Perusall interface
+        const detectTotalPages = async () => {
+            let len = 0;
+            let times = 0;
+            const imageMap = new Map(); // Use Map instead of Set to track by URL
+            let currentPage = 1;
+            
+            // First scroll to top
+            window.scrollTo(0, 0);
+            await new Promise(r => setTimeout(r, 2000));
+
+            return new Promise((resolve) => {
+                const interval = setInterval(() => {
+                    const imgs = document.querySelectorAll('img.chunk');
+                    if (imgs.length > 0) {
+                        // Collect all visible images
+                        imgs.forEach((img, index) => {
+                            if (img.complete && img.naturalWidth > 0 && !imageMap.has(img.src)) {
+                                // Only add if we haven't seen this URL before
+                                const image = new Image();
+                                image.crossOrigin = 'anonymous'; // Enable CORS
+                                image.src = img.src;
+                                
+                                // Calculate page and position based on order
+                                const pageNum = Math.floor(index / 6) + 1;
+                                const positionInPage = index % 6;
+                                
+                                image.dataset.pageNumber = pageNum.toString();
+                                image.dataset.position = positionInPage.toString();
+                                imageMap.set(img.src, image);
+                            }
+                        });
+                        imgs[imgs.length - 1].scrollIntoView();
+                    }
+
+                    if (len < imgs.length) {
+                        len = imgs.length;
+                    } else if (times > 3) {
+                        clearInterval(interval);
+                        const pages = Math.ceil(len / 6); // Each page has 6 chunks
+                        // Convert Map values to array
+                        const uniqueImages = Array.from(imageMap.values());
+                        console.log(`Found ${uniqueImages.length} unique images out of ${len} total chunks`);
+                        resolve({ pages, images: uniqueImages });
+                    } else {
+                        times++;
+                    }
+                }, 2000);
+            });
+        };
+
+        // Wait for page to load and initialize
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Initialize variables and collect images
+        const result = await detectTotalPages(); // Try to detect total pages and collect images
+        if (!result || !result.pages) {
+            throw new Error('Could not detect total pages. Please try again.');
+        }
+        const expectedPages = result.pages;
+        console.log('Detected total pages:', expectedPages);
+
+        // Use the collected images
+        const allImages = result.images;
+        console.log(`Collected ${allImages.length} images during page detection`);
+
+        const expectedImages = expectedPages * 6;
+        console.log(`Expecting ${expectedImages} images (${expectedPages} pages * 6 images per page)`);
+        
+        // Helper function to load an image
+        const loadImage = (url) => new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = url;
+        });
+
+        // Function to collect all available images
+        const collectAllImages = async () => {
+            console.log('Starting image collection...');
+            const imageSet = new Set();
+            const expectedImages = 6 * expectedPages; // Calculate total expected images
+            let currentPage = 1;
+
+            // Helper function to check for new images
+            const checkForNewImages = () => {
+                // Get all images that look like page chunks
+                const currentImages = Array.from(document.querySelectorAll('img'))
+                    .filter(img => {
+                        // Must have a source
+                        if (!img.src) return false;
+                        
+                        // Must be visible
+                        const rect = img.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) return false;
+                        
+                        // Must be a chunk-sized image (not an icon or small image)
+                        if (rect.width < 100 || rect.height < 100) return false;
+                        
+                        // Must have page number in URL or data attributes
+                        const pageNum = getPageNumber(img);
+                        if (pageNum === null) return false;
+                        
+                        return true;
+                    });
+
+                // Sort by vertical position to maintain order
+                currentImages.sort((a, b) => {
+                    const rectA = a.getBoundingClientRect();
+                    const rectB = b.getBoundingClientRect();
+                    return rectA.top - rectB.top;
+                });
+
+                let newImages = 0;
+                currentImages.forEach(img => {
+                    if (!Array.from(imageSet).some(existing => existing.src === img.src)) {
+                        imageSet.add(img);
+                        newImages++;
+                    }
+                });
+
+                if (newImages > 0) {
+                    console.log(`Found ${imageSet.size} total images (+${newImages} new)`);
+                }
+                return newImages;
+            };
+
+            // Helper function to click next button
+            const clickNextButton = async () => {
+                const nextButton = Array.from(document.querySelectorAll('a'))
+                    .find(a => a.textContent.includes('Next'));
+                if (nextButton) {
+                    nextButton.click();
+                    return true;
+                }
+                return false;
+            };
+
+            // Helper function to scroll through content
+            const scrollThroughContent = async () => {
+                const scrollHeight = document.documentElement.scrollHeight;
+                const viewportHeight = window.innerHeight;
+                const scrollStep = Math.floor(viewportHeight / 2);
+                let foundImages = 0;
+                let noNewImagesCount = 0;
+
+                // Start from top
+                window.scrollTo(0, 0);
+                await new Promise(r => setTimeout(r, 500));
+
+                // Scroll until we find all images or hit the bottom multiple times
+                for (let pos = 0; pos <= scrollHeight && noNewImagesCount < 3; pos += scrollStep) {
+                    window.scrollTo(0, pos);
+                    await new Promise(r => setTimeout(r, 500));
+                    
+                    const newImages = checkForNewImages();
+                    foundImages += newImages;
+
+                    if (newImages === 0) {
+                        noNewImagesCount++;
+                    } else {
+                        noNewImagesCount = 0; // Reset counter if we found images
+                    }
+
+                    // If we hit bottom, start from top again if we haven't found enough images
+                    if (pos + viewportHeight >= scrollHeight && foundImages < 6) {
+                        pos = 0;
+                        window.scrollTo(0, 0);
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+                }
+
+                return foundImages;
+            };
+
+            // Create a visual indicator
+            const indicator = document.createElement('div');
+            indicator.style.cssText = 'position: fixed; top: 10px; right: 10px; background: yellow; padding: 10px; z-index: 9999;';
+            document.body.appendChild(indicator);
+
+            // Helper function to update progress
+            const updateProgress = (message) => {
+                indicator.textContent = message;
+                console.log(message);
+            };
+
+            try {
+                updateProgress('Starting image collection...');
+
+                // First collect all images from the current view
+                let totalFound = await scrollThroughContent();
+                if (totalFound < expectedImages) {
+                    // If we haven't found all images, start page by page collection
+                    while (currentPage <= expectedPages) {
+                        updateProgress(`Processing page ${currentPage}/${expectedPages} (${imageSet.size}/${expectedImages} images)`);
+
+                        // Try to find images on the current page
+                        let foundImages = await scrollThroughContent();
+                        let retryCount = 0;
+
+                        // Retry up to 3 times if we don't find exactly 6 images
+                        while (foundImages !== 6 && retryCount < 3) {
+                            window.scrollTo(0, 0);
+                            await new Promise(r => setTimeout(r, 1000));
+                            foundImages = await scrollThroughContent(); // Replace instead of add
+                            retryCount++;
+                        }
+
+                        // If we still don't have 6 images after retries, log warning
+                        if (foundImages !== 6) {
+                            console.warn(`Warning: Found ${foundImages} images on page ${currentPage} (expected 6)`);
+                        }
+
+                        // Move to next page
+                        if (await clickNextButton()) {
+                            currentPage++;
+                            await new Promise(r => setTimeout(r, 2000)); // Wait even longer for page load
+                        } else {
+                            // If we can't click next but haven't found all pages, try refreshing
+                            if (currentPage < expectedPages) {
+                                window.scrollTo(0, 0);
+                                await new Promise(r => setTimeout(r, 2000));
+                                if (!await clickNextButton()) {
+                                    console.warn(`Warning: Could not proceed to next page after ${currentPage}`);
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                updateProgress(`Collection complete. Found ${imageSet.size} images.`);
+                const collectedImages = Array.from(imageSet);
+                return collectedImages;
+            } catch (error) {
+                console.error('Error during image collection:', error);
+                throw error; // Re-throw to handle in outer try-catch
+            } finally {
+                document.body.removeChild(indicator);
+            }
+        };
+
+        // Helper function to get page number from URL or data attributes
+        const getPageNumber = (img) => {
+            // Try URL patterns first
+            const patterns = [
+                /page=(\d+)/, // Standard pattern
+                /page\/(\d+)/, // Alternative pattern
+                /p(\d+)\//, // Another pattern
+                /page-(\d+)/, // Hyphenated pattern
+                /-p(\d+)-/, // Embedded pattern
+                /_(\d+)\.[^.]+$/, // Trailing number pattern
+                /\/(\d+)\./, // Number before extension
+                /chunk[_-](\d+)/, // Chunk number pattern
+                /section[_-](\d+)/, // Section number pattern
+            ];
+            
+            // Try each pattern
+            for (const pattern of patterns) {
+                const match = img.src.match(pattern);
+                if (match) {
+                    return parseInt(match[1]);
+                }
+            }
+            
+            // Try data attributes
+            const dataAttrs = ['data-page', 'data-page-number', 'page', 'data-index'];
+            for (const attr of dataAttrs) {
+                const value = img.getAttribute(attr);
+                if (value) {
+                    return parseInt(value);
+                }
+            }
+            
+            return null; // Return null if no page number found
+        };
+
+        // Images already collected during page detection
+        console.log(`Using ${allImages.length} images collected during page detection`);
+
+        // Sort images by their vertical position and convert to data URLs
+        const imageDataPromises = allImages.map(img => {
+            return new Promise((resolve, reject) => {
+                const loadAndProcess = () => {
+                    try {
+                        const canvas = document.createElement('canvas');
+                        const ctx = canvas.getContext('2d');
+                        canvas.width = img.naturalWidth || img.width;
+                        canvas.height = img.naturalHeight || img.height;
+                        ctx.drawImage(img, 0, 0);
+                        resolve({
+                            dataUrl: canvas.toDataURL('image/jpeg', 0.75),
+                            pageNumber: img.dataset.pageNumber,
+                            position: parseInt(img.dataset.position) || 0
+                        });
+                    } catch (error) {
+                        reject(error);
+                    }
+                };
+
+                if (img.complete) {
+                    loadAndProcess();
+                } else {
+                    img.onload = loadAndProcess;
+                    img.onerror = () => reject(new Error('Failed to load image'));
+                }
+            });
+        });
+
+        // Wait for all images to be processed
+        const processedImages = await Promise.all(imageDataPromises);
+
+        // Group images by page number and sort by position
+        const pageGroups = new Map();
+        processedImages.forEach(img => {
+            const pageNum = parseInt(img.pageNumber) || 1;
+            const position = img.position || 0;
+            
+            if (!pageGroups.has(pageNum)) {
+                pageGroups.set(pageNum, new Array(6).fill(null));
+            }
+            pageGroups.get(pageNum)[position] = img;
+        });
+
+        // Create pages array
+        const pages = [];
+        const pageNumbers = Array.from(pageGroups.keys()).sort((a, b) => a - b);
+        
+        pageNumbers.forEach(pageNum => {
+            const pageChunks = pageGroups.get(pageNum);
+            // Check if page has all chunks
+            if (pageChunks.every(chunk => chunk !== null)) {
+                pages.push(pageChunks.map(img => img.dataUrl));
+                console.log(`Added complete page ${pageNum}`);
+            } else {
+                const missingPositions = pageChunks
+                    .map((chunk, i) => chunk === null ? i : -1)
+                    .filter(i => i !== -1);
+                console.warn(`Page ${pageNum} is missing chunks at positions: ${missingPositions.join(', ')}`);
+            }
+        });
+
+        // Use the organized pages
+        console.log(`Using ${pages.length * 6} images organized into ${pages.length} complete pages`);
+
+        // Create PDF
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({
+            orientation: 'p',
+            unit: 'pt',
+            format: [595.28, 841.89] // A4 size in points
+        });
+
+        // Process each page
+        pages.forEach((pageChunks, pageIndex) => {
+            if (pageIndex > 0) doc.addPage();
+            
+            const pageWidth = doc.internal.pageSize.getWidth();
+            const pageHeight = doc.internal.pageSize.getHeight();
+            
+            // Calculate height for each chunk (divide page height by 6)
+            const chunkHeight = pageHeight / 6;
+            
+            // Add each chunk vertically
+            pageChunks.forEach((chunk, index) => {
+                const y = index * chunkHeight;
+                
+                // Add image to fit full width and calculated height
+                doc.addImage(chunk, 'JPEG', 0, y, pageWidth, chunkHeight, '', 'FAST');
+            });
+        });
+
+        // Get the title
+        const title = (
+            document.querySelector('h1.p-title')?.textContent?.trim() || // Try Perusall title class
+            document.querySelector('.p-title')?.textContent?.trim() || // Try without h1
+            document.querySelector('h1')?.textContent?.trim() || // Try any h1
+            document.querySelector('title')?.textContent?.trim() || // Try page title
+            'perusall_article' // Default title
+        ).replace(/[^a-z0-9]/gi, '_').toLowerCase(); // Clean the title
+
+        // Save the PDF
+        console.log('Saving PDF...');
+        doc.save(title + '.pdf');
+        window.downloaderRunning = false;
+        
+    } catch (error) {
+        console.error('Error:', error);
+        window.downloaderRunning = false;
+    }
+})();
+
